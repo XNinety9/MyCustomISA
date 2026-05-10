@@ -8,7 +8,7 @@ The CPU targets a 64KB address space, drives a 128×128 black-and-white display,
 
 ## Table of Contents
 
-1. [Designing the Memory Map](./mycustomisa_memory_map.md)
+1. [Designing the Memory Map](./doc/mycustomisa_memory_map.md)
    - Word size and address space
    - Memory regions (code, stack, framebuffer, MMIO)
    - Boot state and register initialisation
