@@ -15,7 +15,7 @@ The CPU targets a 64KB address space, drives a 128×128 black-and-white display,
    - Flags and the interrupt system
    - Complete 64KB memory map
 
-2. Designing the Instruction Set `[TODO]`
+2. [Designing the Instruction Set](./doc/mycustomisa_instruction_set.md)
    - Instruction encoding in 16-bit words
    - Operand types and addressing modes
    - Arithmetic, logic, and control flow instructions
