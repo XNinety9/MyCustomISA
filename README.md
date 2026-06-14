@@ -22,6 +22,8 @@ The CPU targets a 64KB address space, drives a 128×128 black-and-white display,
    - PUSH / POP and the call convention
    - MVINT and the trap instruction
 
+-> [ISA reference](./doc/mycustomisa_isa_reference.md)
+
 3. [Writing the Assembler](./mycustomisa-assembler/)
    - Tokenising and parsing assembly source
    - Resolving labels to concrete addresses
