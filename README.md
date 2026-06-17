@@ -29,7 +29,7 @@ The CPU targets a 64KB address space, drives a 128×128 black-and-white display,
    - Resolving labels to concrete addresses
    - Emitting binary output
 
-4. Building the Virtual Machine `[TODO]`
+4. [Building the Virtual Machine](./mycustomisa-vm/)
    - Fetch–decode–execute loop
    - Emulating MMIO (keyboard, display, timer, debug)
    - Interrupt dispatch and context save/restore
