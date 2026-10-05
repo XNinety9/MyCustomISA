@@ -1,0 +1,19 @@
+[package]
+name = "mycustomisa-web"
+version = "0.1.0"
+edition = "2024"
+
+# Plain C ABI exports, no wasm-bindgen: the page drives the VM with the raw
+# WebAssembly API and reads RAM (framebuffer, program variables) directly.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+mycustomisa-core = { path = "../mycustomisa-core" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+codegen-units = 1
+strip = true

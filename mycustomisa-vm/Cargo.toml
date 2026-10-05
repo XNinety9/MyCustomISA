@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+mycustomisa-core = { path = "../mycustomisa-core" }
 slint = "1"
 rfd = "0.15"
 

@@ -34,6 +34,9 @@ The CPU targets a 64KB address space, drives a 128×128 black-and-white display,
    - Emulating MMIO (keyboard, display, timer, debug)
    - Interrupt dispatch and context save/restore
    - Debugger interface and state inspection
+   - [`mycustomisa-core`](./mycustomisa-core/): the CPU and MMIO model, shared by every front-end
+   - [`mycustomisa-web`](./mycustomisa-web/): the same core compiled to WebAssembly (`cargo build --release --target wasm32-unknown-unknown`)
+   - [`snake.asm`](./mycustomisa-assembler/snake.asm): a playable Snake with a demo autopilot, timer and keyboard interrupts
 
 5. FPGA Implementation `[TODO]`
    - Top-level architecture and clock domain

@@ -2775,9 +2775,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mycustomisa-core"
+version = "0.1.0"
+
+[[package]]
 name = "mycustomisa-vm"
 version = "0.1.0"
 dependencies = [
+ "mycustomisa-core",
  "rfd",
  "slint",
  "slint-build",

@@ -126,7 +126,7 @@ fn encode_instruction(instruction: &Instruction, symbols: &HashMap<String, u16>)
                 Operand::Label(name)           => *symbols.get(name).expect(&format!("Undefined label: {}", name)),
                 _ => unreachable!()
             };
-            vec![(0x1F << 11) | (int_num << 6), handler_addr]
+            vec![(0x1F << 11) | (int_num << 5), handler_addr]
         }
     }
 }
