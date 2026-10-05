@@ -178,13 +178,13 @@ fn parse_operand(token: &str) -> Operand {
 
 fn parse_interrupt(token: &str) -> Interrupt {
     match token {
-        "KEYBOARD" => Interrupt::Keyboard,
-        "TIMER" => Interrupt::Timer,
-        "ILLEGAL_INSTRUCTION" => Interrupt::IllegalInstruction,
-        "DIVIDE_BY_ZERO" => Interrupt::DivideByZero,
-        "STACK_OVERFLOW" => Interrupt::StackOverflow,
-        "USER0" => Interrupt::User0,
-        "USER1" => Interrupt::User1,
+        "KEYBOARD" | "0" => Interrupt::Keyboard,
+        "TIMER" | "1" => Interrupt::Timer,
+        "ILLEGAL_INSTRUCTION" | "2" => Interrupt::IllegalInstruction,
+        "DIVIDE_BY_ZERO" | "3" => Interrupt::DivideByZero,
+        "STACK_OVERFLOW" | "4" => Interrupt::StackOverflow,
+        "USER0" | "5" => Interrupt::User0,
+        "USER1" | "6" => Interrupt::User1,
         _ => panic!("Unknown interrupt: {}", token),
     }
 }

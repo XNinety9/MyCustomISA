@@ -1,5 +1,7 @@
 pub mod ui;
 
+use std::collections::{HashSet, VecDeque};
+
 pub const FLAG_Z: u8 = 0;
 pub const FLAG_C: u8 = 1;
 pub const FLAG_V: u8 = 2;
@@ -19,22 +21,97 @@ impl CPU {
     }
 }
 
+pub struct Timer {
+    pub period: u16,
+    pub counter: u16,
+    pub enabled: bool,
+    pub loop_mode: bool,
+    pub pending_interrupt: bool,
+}
+
+impl Timer {
+    fn new() -> Timer {
+        Timer { period: 0, counter: 0, enabled: false, loop_mode: false, pending_interrupt: false }
+    }
+}
+
+pub struct Keyboard {
+    pub queue: VecDeque<u8>,
+    pub modifiers: u8,
+    pub held: HashSet<u8>,
+    pub last_keycode: u8,
+    pub pending_interrupt: bool,
+    pub caps_lock: bool,
+}
+
+impl Keyboard {
+    fn new() -> Keyboard {
+        Keyboard {
+            queue: VecDeque::new(),
+            modifiers: 0,
+            held: HashSet::new(),
+            last_keycode: 0,
+            pending_interrupt: false,
+            caps_lock: false,
+        }
+    }
+}
+
 pub struct VirtualMachine {
     pub cpu: CPU,
     pub ram: Vec<u8>,
     pub halted: bool,
+    pub keyboard: Keyboard,
+    pub timer: Timer,
 }
 
 impl VirtualMachine {
-    pub fn read_u16(&self, addr: u16) -> u16 {
-        ((self.ram[addr as usize] as u16) << 8) | (self.ram[(addr + 1) as usize] as u16)
+    pub fn read_u16(&mut self, addr: u16) -> u16 {
+        match addr {
+            // Keyboard MMIO
+            0xFD00 => self.keyboard.queue.len() as u16,
+            0xFD01 => self.keyboard.modifiers as u16,
+            0xFD02 => {
+                if let Some(kc) = self.keyboard.queue.pop_front() {
+                    self.keyboard.last_keycode = kc;
+                    kc as u16
+                } else {
+                    0
+                }
+            }
+            0xFD03 => self.keyboard.held.contains(&self.keyboard.last_keycode) as u16,
+            // TIMER_LO/HI — returns current countdown
+            0xFD15 => self.timer.counter,
+            // TIMER_CTRL — bit 0: ENABLE, bit 1: LOOP
+            0xFD17 => (self.timer.enabled as u16) | ((self.timer.loop_mode as u16) << 1),
+            _ => ((self.ram[addr as usize] as u16) << 8) | (self.ram[(addr + 1) as usize] as u16),
+        }
+    }
+
+    pub fn write_u16(&mut self, addr: u16, value: u16) {
+        match addr {
+            // TIMER_LO/HI — set reload period and reset counter to that period
+            0xFD15 => {
+                self.timer.period = value;
+                self.timer.counter = value;
+            }
+            // TIMER_CTRL — bit 0: ENABLE, bit 1: LOOP
+            0xFD17 => {
+                self.timer.enabled = (value & 0x01) != 0;
+                self.timer.loop_mode = (value & 0x02) != 0;
+            }
+            _ => {
+                self.ram[addr as usize] = ((value & 0xFF00) >> 8) as u8;
+                self.ram[(addr + 1) as usize] = (value & 0xFF) as u8;
+            }
+        }
     }
 
     fn extract_register(&self, instruction: u16) -> u16 {
         (instruction & 0x01E0) >> 5
     }
 
-    fn get_operand_value(&self, mode: u16, instruction_word: u16, next_word: Option<u16>) -> u16 {
+    fn get_operand_value(&mut self, mode: u16, instruction_word: u16, next_word: Option<u16>) -> u16 {
         match mode {
             0b00 => next_word.expect("Immediate mode requires a following word"),
             0b01 => {
@@ -55,7 +132,7 @@ impl VirtualMachine {
     }
 
     pub fn new() -> VirtualMachine {
-        VirtualMachine { cpu: CPU::new(), ram: vec![0; 65536], halted: false }
+        VirtualMachine { cpu: CPU::new(), ram: vec![0; 65536], halted: false, keyboard: Keyboard::new(), timer: Timer::new() }
     }
 
     pub fn load(&mut self, path: &str) -> Result<(), String> {
@@ -101,9 +178,49 @@ impl VirtualMachine {
         self.cpu.pc = self.read_u16(ivt_addr);
     }
 
+    pub fn key_down(&mut self, keycode: u8, modifiers: u8) {
+        self.keyboard.held.insert(keycode);
+        if self.keyboard.queue.len() >= 16 {
+            self.keyboard.queue.pop_front();
+        }
+        self.keyboard.queue.push_back(keycode);
+        self.keyboard.modifiers = modifiers;
+        self.keyboard.pending_interrupt = true;
+    }
+
+    pub fn key_up(&mut self, keycode: u8) {
+        self.keyboard.held.remove(&keycode);
+    }
+
+    pub fn instruction_byte_range(&self) -> (u16, u16) {
+        let pc = self.cpu.pc;
+        if (pc as usize) + 1 >= self.ram.len() { return (pc, pc + 1); }
+        let word = ((self.ram[pc as usize] as u16) << 8) | self.ram[(pc + 1) as usize] as u16;
+        let opcode = (word & 0xF800) >> 11;
+        let mode = (word & 0x0600) >> 9;
+        let is_32bit = opcode != 0 && (mode == 0b00 || mode == 0b11);
+        if is_32bit { (pc, pc + 3) } else { (pc, pc + 1) }
+    }
+
     // Execute one instruction. Returns false when the CPU has halted.
     pub fn step(&mut self) -> bool {
         if self.halted { return false; }
+
+        // Deliver pending keyboard interrupt before next instruction
+        if self.keyboard.pending_interrupt {
+            self.keyboard.pending_interrupt = false;
+            let ret_pc = self.cpu.pc;
+            self.trigger_interrupt(0, ret_pc);
+            return !self.halted;
+        }
+
+        // Deliver pending timer interrupt (lower priority than keyboard)
+        if self.timer.pending_interrupt {
+            self.timer.pending_interrupt = false;
+            let ret_pc = self.cpu.pc;
+            self.trigger_interrupt(1, ret_pc);
+            return !self.halted;
+        }
 
         'execute: {
             let instruction: u16 = self.read_u16(self.cpu.pc);
@@ -114,13 +231,16 @@ impl VirtualMachine {
                 0x00 => {
                     let sub = (instruction & 0x0780) >> 7;
                     match sub {
-                        0x00 => { self.halted = true; break 'execute; }           // HALT
-                        0x01 => {                                                  // RET
+                        // HALT — stop execution permanently
+                        0x00 => { self.halted = true; break 'execute; }
+                        // RET — pop PC from stack, return to caller
+                        0x01 => {
                             self.cpu.pc = self.read_u16(self.cpu.sp);
                             self.cpu.sp += 2;
                             break 'execute;
                         }
-                        0x02 => {                                                  // RETI
+                        // RETI — return from interrupt: pop PC, all 16 registers, then flags
+                        0x02 => {
                             self.cpu.pc = self.read_u16(self.cpu.sp);
                             self.cpu.sp += 2;
                             for i in (0..=15).rev() {
@@ -131,14 +251,14 @@ impl VirtualMachine {
                             self.cpu.sp += 1;
                             break 'execute;
                         }
-                        0x03 => self.cpu.flags |= 1 << FLAG_Z,                    // SEZ
-                        0x04 => self.cpu.flags &= !(1 << FLAG_Z),                 // CLZ
-                        0x05 => self.cpu.flags |= 1 << FLAG_C,                    // SEC
-                        0x06 => self.cpu.flags &= !(1 << FLAG_C),                 // CLC
-                        0x07 => self.cpu.flags |= 1 << FLAG_V,                    // SEV
-                        0x08 => self.cpu.flags &= !(1 << FLAG_V),                 // CLV
-                        0x09 => self.cpu.flags |= 1 << FLAG_N,                    // SEN
-                        0x0A => self.cpu.flags &= !(1 << FLAG_N),                 // CLN
+                        0x03 => self.cpu.flags |= 1 << FLAG_Z,                    // SEZ — set Zero flag
+                        0x04 => self.cpu.flags &= !(1 << FLAG_Z),                 // CLZ — clear Zero flag
+                        0x05 => self.cpu.flags |= 1 << FLAG_C,                    // SEC — set Carry flag
+                        0x06 => self.cpu.flags &= !(1 << FLAG_C),                 // CLC — clear Carry flag
+                        0x07 => self.cpu.flags |= 1 << FLAG_V,                    // SEV — set Overflow flag
+                        0x08 => self.cpu.flags &= !(1 << FLAG_V),                 // CLV — clear Overflow flag
+                        0x09 => self.cpu.flags |= 1 << FLAG_N,                    // SEN — set Negative flag
+                        0x0A => self.cpu.flags &= !(1 << FLAG_N),                 // CLN — clear Negative flag
                         _ => unreachable!("Unknown sub-opcode 0x{:X}", sub),
                     }
                     self.cpu.pc += 2;
@@ -153,14 +273,14 @@ impl VirtualMachine {
                     } else { None };
 
                     match opcode {
-                        // PUSH
+                        // PUSH — SP -= 2; write operand word to [SP]
                         0x01 => {
                             let value = self.get_operand_value(mode, instruction, next_word);
                             self.ram[(self.cpu.sp - 2) as usize] = ((value & 0xFF00) >> 8) as u8;
                             self.ram[(self.cpu.sp - 1) as usize] = (value & 0xFF) as u8;
                             self.cpu.sp -= 2;
                         }
-                        // POP
+                        // POP — read word from [SP], SP += 2; write to register or memory destination
                         0x02 => {
                             self.cpu.sp += 2;
                             let value = self.read_u16(self.cpu.sp - 2);
@@ -168,15 +288,13 @@ impl VirtualMachine {
                                 self.cpu.registers[register as usize] = value;
                             } else if mode == 0b10 {
                                 let addr = self.cpu.registers[register as usize];
-                                self.ram[addr as usize]       = ((value & 0xFF00) >> 8) as u8;
-                                self.ram[(addr + 1) as usize] = (value & 0xFF) as u8;
+                                self.write_u16(addr, value);
                             } else if mode == 0b11 {
                                 let dest = next_word.unwrap();
-                                self.ram[dest as usize]       = ((value & 0xFF00) >> 8) as u8;
-                                self.ram[(dest + 1) as usize] = (value & 0xFF) as u8;
+                                self.write_u16(dest, value);
                             }
                         }
-                        // NOT
+                        // NOT — bitwise invert register in-place; sets Z, N
                         0x03 => {
                             let result = !self.cpu.registers[register as usize];
                             self.cpu.registers[register as usize] = result;
@@ -266,7 +384,7 @@ impl VirtualMachine {
                                 break 'execute;
                             }
                         }
-                        // CALL
+                        // CALL — push return address onto stack, jump to target
                         0x0F => {
                             let pc_step: u16 = if mode == 0b00 || mode == 0b11 { 4 } else { 2 };
                             let ret = self.cpu.pc + pc_step;
@@ -276,7 +394,7 @@ impl VirtualMachine {
                             self.cpu.pc = self.get_operand_value(mode, instruction, next_word);
                             break 'execute;
                         }
-                        // TRAP
+                        // TRAP — software interrupt: push flags, all regs, and return PC; jump via IVT[0xFE0A + trap*2]
                         0x10 => {
                             let trap_num = next_word.unwrap();
                             let ret = self.cpu.pc + 4;
@@ -294,9 +412,9 @@ impl VirtualMachine {
                             self.cpu.pc = self.read_u16(ivt_addr);
                             break 'execute;
                         }
-                        // GETSP
+                        // GETSP — copy SP into destination register
                         0x11 => { self.cpu.registers[register as usize] = self.cpu.sp; }
-                        // SETSP
+                        // SETSP — copy source register into SP
                         0x12 => { self.cpu.sp = self.cpu.registers[register as usize]; }
                         _ => unreachable!("Unknown opcode in Format 1: 0x{:X}", opcode),
                     }
@@ -316,32 +434,27 @@ impl VirtualMachine {
                     let pc_step: u16 = if mode == 0b00 || mode == 0b11 { 4 } else { 2 };
 
                     match opcode {
-                        // LOAD: source → register
-                        // 16-bit (mode 10): [R{reg_a}] → R{reg_b}
-                        // 32-bit (mode 00/11): immediate or mem[addr] → R{reg_a}
+                        // LOAD — read value from immediate / [reg] / [addr], store into register
                         0x13 => {
                             let value = self.get_operand_value(mode, instruction, next_word);
                             let dest = if mode == 0b10 { reg_b } else { reg_a };
                             self.cpu.registers[dest as usize] = value;
                         }
-                        // STORE: R{reg_a} → memory
-                        // mode 10: dest address = registers[reg_b]  (16-bit, no next_word)
-                        // mode 11: dest address = next_word          (32-bit)
+                        // STORE — write R{reg_a} to memory; mode 10: dest=[R{reg_b}], mode 11: dest=next_word
                         0x14 => {
-                            let src_val  = self.cpu.registers[reg_a as usize];
+                            let src_val   = self.cpu.registers[reg_a as usize];
                             let dest_addr = if mode == 0b10 {
                                 self.cpu.registers[reg_b as usize]
                             } else {
                                 next_word.unwrap()
                             };
-                            self.ram[dest_addr as usize]       = ((src_val & 0xFF00) >> 8) as u8;
-                            self.ram[(dest_addr + 1) as usize] = (src_val & 0xFF) as u8;
+                            self.write_u16(dest_addr, src_val);
                         }
-                        // MOVE: R{reg_a} → R{reg_b}  (16-bit only)
+                        // MOVE — copy R{reg_a} into R{reg_b}; no flags
                         0x15 => {
                             self.cpu.registers[reg_b as usize] = self.cpu.registers[reg_a as usize];
                         }
-                        // ADD: dest = dest + src  (Z, C, V, N)
+                        // ADD — dest += src; sets Z, C (unsigned overflow), V (signed overflow), N
                         0x16 => {
                             let (src, di) = if mode == 0b01 {
                                 (self.cpu.registers[reg_a as usize], reg_b as usize)
@@ -359,7 +472,7 @@ impl VirtualMachine {
                                 result & 0x8000 != 0,
                             );
                         }
-                        // SUB: dest = dest - src  (Z, C, V, N)
+                        // SUB — dest -= src; sets Z, C (borrow), V (signed overflow), N
                         0x17 => {
                             let (src, di) = if mode == 0b01 {
                                 (self.cpu.registers[reg_a as usize], reg_b as usize)
@@ -371,13 +484,12 @@ impl VirtualMachine {
                             self.cpu.registers[di] = result;
                             self.set_flags_zcvn(
                                 result == 0,
-                                prev < src,                                        // unsigned borrow
-                                ((prev ^ src) & (prev ^ result) & 0x8000) != 0,   // signed overflow
+                                prev < src,
+                                ((prev ^ src) & (prev ^ result) & 0x8000) != 0,
                                 result & 0x8000 != 0,
                             );
                         }
-                        // MUL: dest = dest * src  (Z, C, V, N)
-                        // C and V both set if result overflows 16 bits
+                        // MUL — dest *= src; C and V both set if the full 32-bit product overflows 16 bits; sets Z, N
                         0x18 => {
                             let (src, di) = if mode == 0b01 {
                                 (self.cpu.registers[reg_a as usize], reg_b as usize)
@@ -390,7 +502,7 @@ impl VirtualMachine {
                             let overflow = full > 0xFFFF;
                             self.set_flags_zcvn(result == 0, overflow, overflow, result & 0x8000 != 0);
                         }
-                        // DIV: dest = dest / src  (Z, N; traps on div/0)
+                        // DIV — dest /= src; sets Z, N; triggers interrupt 3 on division by zero
                         0x19 => {
                             let (src, di) = if mode == 0b01 {
                                 (self.cpu.registers[reg_a as usize], reg_b as usize)
@@ -405,8 +517,7 @@ impl VirtualMachine {
                             self.cpu.registers[di] = result;
                             self.set_flags_zn(result == 0, result & 0x8000 != 0);
                         }
-                        // SHL: dest <<= src  (Z, C, N)
-                        // C = last bit shifted out the top (bit 16-n of original dest)
+                        // SHL — dest <<= src (low 5 bits); C = last bit shifted out; dest = 0 if shift ≥ 16; sets Z, C, N
                         0x1A => {
                             let (src, di) = if mode == 0b01 {
                                 (self.cpu.registers[reg_a as usize], reg_b as usize)
@@ -420,8 +531,7 @@ impl VirtualMachine {
                             self.cpu.registers[di] = result;
                             self.set_flags_zcn(result == 0, c, result & 0x8000 != 0);
                         }
-                        // SHR: dest >>= src  (Z, C, N) — logical (zero-fill)
-                        // C = last bit shifted out the bottom (bit n-1 of original dest)
+                        // SHR — dest >>= src (low 5 bits); C = last bit shifted out; dest = 0 if shift ≥ 16; sets Z, C, N
                         0x1B => {
                             let (src, di) = if mode == 0b01 {
                                 (self.cpu.registers[reg_a as usize], reg_b as usize)
@@ -435,7 +545,7 @@ impl VirtualMachine {
                             self.cpu.registers[di] = result;
                             self.set_flags_zcn(result == 0, c, result & 0x8000 != 0);
                         }
-                        // AND: dest &= src  (Z, N)
+                        // AND — dest &= src; sets Z, N
                         0x1C => {
                             let (src, di) = if mode == 0b01 {
                                 (self.cpu.registers[reg_a as usize], reg_b as usize)
@@ -446,7 +556,7 @@ impl VirtualMachine {
                             self.cpu.registers[di] = result;
                             self.set_flags_zn(result == 0, result & 0x8000 != 0);
                         }
-                        // OR: dest |= src  (Z, N)
+                        // OR — dest |= src; sets Z, N
                         0x1D => {
                             let (src, di) = if mode == 0b01 {
                                 (self.cpu.registers[reg_a as usize], reg_b as usize)
@@ -457,7 +567,7 @@ impl VirtualMachine {
                             self.cpu.registers[di] = result;
                             self.set_flags_zn(result == 0, result & 0x8000 != 0);
                         }
-                        // CMP: flags from dest - src, result discarded  (Z, C, V, N)
+                        // CMP — compute dest - src, set Z/C/V/N, discard result (flags only, dest unchanged)
                         0x1E => {
                             let (src, di) = if mode == 0b01 {
                                 (self.cpu.registers[reg_a as usize], reg_b as usize)
@@ -473,14 +583,12 @@ impl VirtualMachine {
                                 result & 0x8000 != 0,
                             );
                         }
-                        // MVINT: IVT[int_id] = handler_address
-                        // int_id is bits 7:5 of the first word; handler is next_word
+                        // MVINT — write handler address into IVT slot at 0xFE00 + int_id*2
                         0x1F => {
                             let int_id   = (instruction & 0x00E0) >> 5;
                             let handler  = next_word.unwrap();
                             let ivt_addr = 0xFE00_u16 + int_id * 2;
-                            self.ram[ivt_addr as usize]       = ((handler & 0xFF00) >> 8) as u8;
-                            self.ram[(ivt_addr + 1) as usize] = (handler & 0xFF) as u8;
+                            self.write_u16(ivt_addr, handler);
                         }
                         _ => unreachable!("Unknown opcode in Format 2: 0x{:X}", opcode),
                     }
@@ -491,6 +599,19 @@ impl VirtualMachine {
                 _ => unreachable!("Unknown opcode: 0x{:X}", opcode),
             }
         } // end 'execute
+
+        // Tick timer once per instruction; fire when counter reaches zero
+        if self.timer.enabled && self.timer.period > 0 {
+            self.timer.counter = self.timer.counter.saturating_sub(1);
+            if self.timer.counter == 0 {
+                self.timer.pending_interrupt = true;
+                if self.timer.loop_mode {
+                    self.timer.counter = self.timer.period;
+                } else {
+                    self.timer.enabled = false;
+                }
+            }
+        }
 
         !self.halted
     }
@@ -509,16 +630,13 @@ pub fn decode_instruction(pc: u16, ram: &[u8]) -> String {
     let word    = ((ram[pc] as u16) << 8) | ram[pc + 1] as u16;
     let opcode  = (word & 0xF800) >> 11;
     let mode    = (word & 0x0600) >> 9;
-    let reg_a   = (word & 0x01E0) >> 5;   // reg_s or primary reg
-    let reg_b   = (word & 0x001E) >> 1;   // reg_d (16-bit fmt2 only)
+    let reg_a   = (word & 0x01E0) >> 5;
+    let reg_b   = (word & 0x001E) >> 1;
 
-    // Second word, if present (pc+2 .. pc+3)
     let next = || -> u16 {
         if pc + 3 < ram.len() { ((ram[pc + 2] as u16) << 8) | ram[pc + 3] as u16 } else { 0 }
     };
 
-    // Format the source operand for Format-1 instructions and
-    // the source side of Format-2 instructions.
     let src = |mode: u16| -> String {
         match mode {
             0b00 => format!("0x{:04X}", next()),
@@ -530,7 +648,6 @@ pub fn decode_instruction(pc: u16, ram: &[u8]) -> String {
     };
 
     match opcode {
-        // ── Format 0 ─────────────────────────────────────────────────
         0x00 => {
             let sub = (word & 0x0780) >> 7;
             match sub {
@@ -543,7 +660,6 @@ pub fn decode_instruction(pc: u16, ram: &[u8]) -> String {
             }.into()
         }
 
-        // ── Format 1 ─────────────────────────────────────────────────
         op @ 0x01..=0x12 => {
             let mne = match op {
                 0x01 => "PUSH",  0x02 => "POP",   0x03 => "NOT",
@@ -557,10 +673,6 @@ pub fn decode_instruction(pc: u16, ram: &[u8]) -> String {
             format!("{} {}", mne, src(mode))
         }
 
-        // ── Format 2 ─────────────────────────────────────────────────
-
-        // LOAD: 16-bit → [R{reg_a}] src, R{reg_b} dst
-        //       32-bit → payload src, R{reg_a} dst
         0x13 => match mode {
             0b10 => format!("LOAD [R{}], R{}", reg_a, reg_b),
             0b00 => format!("LOAD 0x{:04X}, R{}", next(), reg_a),
@@ -568,18 +680,14 @@ pub fn decode_instruction(pc: u16, ram: &[u8]) -> String {
             _    => format!("LOAD ???, R{}", reg_a),
         },
 
-        // STORE: reg_a = source register, payload = destination
         0x14 => match mode {
             0b10 => format!("STORE R{}, [R{}]", reg_a, next() & 0xF),
             0b11 => format!("STORE R{}, [0x{:04X}]", reg_a, next()),
             _    => format!("STORE R{}, ???", reg_a),
         },
 
-        // MOVE: always 16-bit register-to-register
         0x15 => format!("MOVE R{}, R{}", reg_a, reg_b),
 
-        // Arithmetic / logic: 16-bit → R{reg_a} src, R{reg_b} dst
-        //                     32-bit → immediate src, R{reg_a} dst
         op @ 0x16..=0x1E => {
             let mne = match op {
                 0x16 => "ADD", 0x17 => "SUB", 0x18 => "MUL",
@@ -595,7 +703,6 @@ pub fn decode_instruction(pc: u16, ram: &[u8]) -> String {
             format!("{} {}, {}", mne, s, d)
         }
 
-        // MVINT: 3-bit interrupt id packed in bits 7:5
         0x1F => {
             let int_id = (word & 0x00E0) >> 5;
             format!("MVINT {}, 0x{:04X}", int_id, next())

@@ -1,43 +1,70 @@
 import { Button, VerticalBox, HorizontalBox, ListView } from "std-widgets.slint";
 
-struct RegEntry {
-    name: string,
-    value: string,
+struct RegPair {
+    left-name: string,
+    left-value: string,
+    right-name: string,
+    right-value: string,
+}
+
+struct HexRow {
+    addr: string,
+    pre-hex: string,
+    hi-hex: string,
+    post-hex: string,
+    ascii: string,
+    has-highlight: bool,
 }
 
 export component AppWindow inherits Window {
     title: "MyCustomISA VM Debugger";
-    min-width: 940px;
-    min-height: 560px;
+    min-width: 1020px;
+    min-height: 760px;
     background: #1a1a1a;
 
     // CPU state
-    in property <string>     pc-text:       "0x0000";
-    in property <string>     sp-text:       "0xF4FF";
-    in property <string>     instr-hex:     "0x0000";
-    in property <string>     instr-decoded: "---";
-    in property <[RegEntry]> registers;
-    in property <bool>       flag-z;
-    in property <bool>       flag-c;
-    in property <bool>       flag-v;
-    in property <bool>       flag-n;
-    in property <bool>       flag-r;
-    in property <image>      display-image;
+    in property <string>       pc-text:       "0x0000";
+    in property <string>       sp-text:       "0xF4FF";
+    in property <string>       instr-hex:     "0x0000";
+    in property <string>       instr-decoded: "---";
+    in property <[RegPair]>    registers;
+    in property <bool>         flag-z;
+    in property <bool>         flag-c;
+    in property <bool>         flag-v;
+    in property <bool>         flag-n;
+    in property <bool>         flag-r;
+    in property <image>        display-image;
 
     // Control state
     in property <bool> is-running: false;
     in property <bool> is-halted:  false;
 
+    // Keyboard state
+    in property <int>    kb-queue:    0;
+    in property <bool>   kb-shift:    false;
+    in property <bool>   kb-ctrl:     false;
+    in property <bool>   kb-alt:      false;
+    in property <bool>   kb-caps:     false;
+    in property <string> kb-last-key: "0x00";
+
+    // Hexdump
+    in property <[HexRow]> hex-rows;
+
     callback load-clicked();
     callback step-clicked();
     callback run-clicked();
     callback pause-clicked();
+    callback key-down(string, bool, bool, bool);
+    callback key-up(string);
 
+    forward-focus: focus-scope;
+
+    // ── Main layout (direct Window child → fills window correctly) ───────
     VerticalBox {
         padding: 10px;
-        spacing: 8px;
+        spacing: 6px;
 
-        // ── Toolbar ──────────────────────────────────────────────────
+        // ── Toolbar ──────────────────────────────────────────────────────
         HorizontalBox {
             spacing: 6px;
             alignment: start;
@@ -68,7 +95,7 @@ export component AppWindow inherits Window {
             }
         }
 
-        // ── Instruction bar ──────────────────────────────────────────
+        // ── Instruction bar ───────────────────────────────────────────────
         Rectangle {
             height: 38px;
             background: #252525;
@@ -77,43 +104,52 @@ export component AppWindow inherits Window {
                 padding-left: 12px;
                 padding-right: 12px;
                 spacing: 18px;
-                Text { text: "PC";            color: #555; font-family: "monospace"; vertical-alignment: center; }
-                Text { text: root.pc-text;    color: #7ec8e3; font-family: "monospace"; font-weight: 700; vertical-alignment: center; }
+                Text { text: "PC";               color: #555; font-family: "monospace"; vertical-alignment: center; }
+                Text { text: root.pc-text;        color: #7ec8e3; font-family: "monospace"; font-weight: 700; vertical-alignment: center; }
                 Rectangle { width: 1px; background: #444; }
-                Text { text: root.instr-hex;     color: #888; font-family: "monospace"; vertical-alignment: center; }
+                Text { text: root.instr-hex;      color: #888; font-family: "monospace"; vertical-alignment: center; }
                 Rectangle { width: 1px; background: #444; }
-                Text { text: root.instr-decoded; color: #dde; font-family: "monospace"; font-weight: 700; vertical-alignment: center; }
+                Text { text: root.instr-decoded;  color: #dde; font-family: "monospace"; font-weight: 700; vertical-alignment: center; }
             }
         }
 
-        // ── Registers | Flags | Display ──────────────────────────────
+        // ── Registers | Flags | Display ───────────────────────────────────
         HorizontalBox {
-            spacing: 8px;
+            spacing: 6px;
 
-            // Register list
+            // Register list — two columns, fixed height
             Rectangle {
                 background: #222;
                 border-radius: 5px;
                 horizontal-stretch: 1;
-                VerticalBox {
-                    padding: 10px;
-                    spacing: 2px;
-                    Text { text: "REGISTERS"; color: #555; font-size: 10px; font-weight: 700; }
-                    ListView {
-                        for r in root.registers: Rectangle {
-                            height: 22px;
-                            HorizontalBox {
-                                padding: 2px;
-                                spacing: 0px;
-                                Text { text: r.name;  color: #667; font-family: "monospace"; font-size: 12px; width: 44px; vertical-alignment: center; }
-                                Text { text: r.value; color: #ccd; font-family: "monospace"; font-size: 12px; vertical-alignment: center; }
-                            }
+
+                Text {
+                    x: 10px; y: 10px;
+                    text: "REGISTERS";
+                    color: #555; font-size: 10px; font-weight: 700;
+                }
+
+                ListView {
+                    x: 0; y: 26px;
+                    width: parent.width;
+                    height: parent.height - 26px;
+                    for r in root.registers: Rectangle {
+                        height: 28px;
+                        HorizontalBox {
+                            padding-left: 6px;
+                            padding-right: 6px;
+                            spacing: 0px;
+                            Text { text: r.left-name;  color: #667; font-family: "monospace"; font-size: 12px; width: 34px; vertical-alignment: center; }
+                            Text { text: r.left-value; color: #ccd; font-family: "monospace"; font-size: 12px; width: 64px; vertical-alignment: center; }
+                            Rectangle { width: 10px; }
+                            Text { text: r.right-name;  color: #667; font-family: "monospace"; font-size: 12px; width: 34px; vertical-alignment: center; }
+                            Text { text: r.right-value; color: #ccd; font-family: "monospace"; font-size: 12px; vertical-alignment: center; }
                         }
                     }
                 }
             }
 
-            // Flags + SP
+            // Flags
             Rectangle {
                 background: #222;
                 border-radius: 5px;
@@ -172,6 +208,160 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+        }
+
+        // ── Keyboard | Hexdump ────────────────────────────────────────────
+        HorizontalBox {
+            spacing: 6px;
+            vertical-stretch: 1;
+            min-height: 300px;
+
+            // Keyboard status panel
+            Rectangle {
+                background: #222;
+                border-radius: 5px;
+                width: 160px;
+                VerticalBox {
+                    padding: 10px;
+                    spacing: 10px;
+                    alignment: start;
+                    Text { text: "KEYBOARD"; color: #555; font-size: 10px; font-weight: 700; }
+
+                    VerticalBox {
+                        spacing: 4px;
+                        Text { text: "QUEUE"; color: #555; font-family: "monospace"; font-size: 10px; }
+                        Text {
+                            text: root.kb-queue + " / 16";
+                            color: root.kb-queue > 0 ? #e5c07b : #667;
+                            font-family: "monospace"; font-size: 13px; font-weight: 700;
+                        }
+                    }
+
+                    Rectangle { height: 1px; background: #333; }
+
+                    VerticalBox {
+                        spacing: 5px;
+                        Text { text: "MODIFIERS"; color: #555; font-family: "monospace"; font-size: 10px; }
+                        HorizontalBox {
+                            spacing: 5px;
+                            alignment: start;
+                            Rectangle {
+                                width: 34px; height: 22px; border-radius: 3px;
+                                background: root.kb-shift ? #3a3a5c : #2a2a2a;
+                                border-width: 1px;
+                                border-color: root.kb-shift ? #7b7bcc : #444;
+                                Text { text: "SHF"; color: root.kb-shift ? #aab : #556; font-family: "monospace"; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
+                            }
+                            Rectangle {
+                                width: 34px; height: 22px; border-radius: 3px;
+                                background: root.kb-ctrl ? #3a3a5c : #2a2a2a;
+                                border-width: 1px;
+                                border-color: root.kb-ctrl ? #7b7bcc : #444;
+                                Text { text: "CTL"; color: root.kb-ctrl ? #aab : #556; font-family: "monospace"; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
+                            }
+                            Rectangle {
+                                width: 34px; height: 22px; border-radius: 3px;
+                                background: root.kb-alt ? #3a3a5c : #2a2a2a;
+                                border-width: 1px;
+                                border-color: root.kb-alt ? #7b7bcc : #444;
+                                Text { text: "ALT"; color: root.kb-alt ? #aab : #556; font-family: "monospace"; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
+                            }
+                        }
+                        Rectangle {
+                            height: 22px; border-radius: 3px;
+                            background: root.kb-caps ? #3a5c3a : #2a2a2a;
+                            border-width: 1px;
+                            border-color: root.kb-caps ? #7bcc7b : #444;
+                            Text { text: "CAPS LOCK"; color: root.kb-caps ? #aba : #556; font-family: "monospace"; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                    }
+
+                    Rectangle { height: 1px; background: #333; }
+
+                    VerticalBox {
+                        spacing: 4px;
+                        Text { text: "LAST KEY"; color: #555; font-family: "monospace"; font-size: 10px; }
+                        Text { text: root.kb-last-key; color: #c678dd; font-family: "monospace"; font-size: 13px; font-weight: 700; }
+                    }
+                }
+            }
+
+            // Hexdump panel
+            Rectangle {
+                background: #1e1e1e;
+                border-radius: 5px;
+                horizontal-stretch: 1;
+                clip: true;
+
+                Text {
+                    x: 8px; y: 8px;
+                    text: "HEXDUMP"; color: #555; font-size: 10px; font-weight: 700;
+                }
+
+                ListView {
+                    x: 0; y: 24px;
+                    width: parent.width;
+                    height: parent.height - 24px;
+                    for r in root.hex-rows: Rectangle {
+                        height: 24px;
+                        background: r.has-highlight ? #2a2200 : transparent;
+                        border-radius: 2px;
+                        HorizontalBox {
+                            padding-left: 4px;
+                            padding-right: 4px;
+                            spacing: 0px;
+
+                            Text {
+                                text: r.addr;
+                                color: #667;
+                                font-family: "monospace"; font-size: 11px;
+                                width: 62px; vertical-alignment: center;
+                            }
+                            Text {
+                                text: r.pre-hex;
+                                color: #8a9;
+                                font-family: "monospace"; font-size: 11px;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: r.hi-hex;
+                                color: r.has-highlight ? #e5c07b : #8a9;
+                                font-family: "monospace"; font-size: 11px;
+                                font-weight: r.has-highlight ? 700 : 400;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: r.post-hex;
+                                color: #8a9;
+                                font-family: "monospace"; font-size: 11px;
+                                vertical-alignment: center;
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            Text {
+                                text: r.ascii;
+                                color: #556;
+                                font-family: "monospace"; font-size: 11px;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Key capture overlay (transparent, doesn't affect layout) ─────────
+    focus-scope := FocusScope {
+        x: 0; y: 0;
+        width: root.width;
+        height: root.height;
+        key-pressed(event) => {
+            root.key-down(event.text, event.modifiers.shift, event.modifiers.control, event.modifiers.alt);
+            accept
+        }
+        key-released(event) => {
+            root.key-up(event.text);
+            accept
         }
     }
 }

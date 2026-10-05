@@ -195,7 +195,7 @@ fn encode_format2(opcode: u16, src: &Operand, dst: &Operand, symbols: &HashMap<S
         vec![(opcode << 11) | (mode << 9) | (reg << 5), payload]
     } else {
         let reg_s = match src {
-            Operand::Register(r) => *r as u16,
+            Operand::Register(r) | Operand::IndirectRegister(r) => *r as u16,
             _ => unreachable!()
         };
         let reg_d = match dst {

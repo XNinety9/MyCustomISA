@@ -2,11 +2,62 @@ use std::rc::Rc;
 use std::cell::RefCell;
 use std::time::Duration;
 
-use slint::{Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, Timer, TimerMode, VecModel};
+use slint::{Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, Timer, TimerMode, VecModel};
 
 use crate::VirtualMachine;
 
 slint::include_modules!();
+
+// ── Key mapping ───────────────────────────────────────────────────────
+
+// Slint Unicode values for special keys (from i-slint-common key_codes.rs)
+const KEY_DELETE:    char = '\u{007F}';
+const KEY_SHIFT:     char = '\u{0010}';
+const KEY_CTRL:      char = '\u{0011}';
+const KEY_ALT:       char = '\u{0012}';
+const KEY_CAPS_LOCK: char = '\u{0014}';
+const KEY_SHIFT_R:   char = '\u{0015}';
+const KEY_CTRL_R:    char = '\u{0016}';
+const KEY_UP:        char = '\u{F700}';
+const KEY_DOWN:      char = '\u{F701}';
+const KEY_LEFT:      char = '\u{F702}';
+const KEY_RIGHT:     char = '\u{F703}';
+// F1–F12: \u{F704}–\u{F70F}
+const KEY_INSERT:    char = '\u{F727}';
+const KEY_HOME:      char = '\u{F729}';
+const KEY_END:       char = '\u{F72B}';
+const KEY_PAGE_UP:   char = '\u{F72C}';
+const KEY_PAGE_DOWN: char = '\u{F72D}';
+
+fn is_modifier_key(c: char) -> bool {
+    matches!(c, KEY_SHIFT | KEY_CTRL | KEY_ALT | KEY_CAPS_LOCK | KEY_SHIFT_R | KEY_CTRL_R)
+}
+
+fn slint_key_to_keycode(text: &SharedString) -> Option<u8> {
+    let c = text.chars().next()?;
+    if text.len() != c.len_utf8() { return None; } // multi-char strings not mapped
+
+    match c {
+        // Standard ASCII (0x00–0x7E), excluding 0x7F which is the Delete *key*
+        c if (c as u32) < 0x7F => Some(c as u8),
+        KEY_DELETE    => Some(0x99),
+        KEY_UP        => Some(0x90),
+        KEY_DOWN      => Some(0x91),
+        KEY_LEFT      => Some(0x92),
+        KEY_RIGHT     => Some(0x93),
+        KEY_PAGE_UP   => Some(0x94),
+        KEY_PAGE_DOWN => Some(0x95),
+        KEY_HOME      => Some(0x96),
+        KEY_END       => Some(0x97),
+        KEY_INSERT    => Some(0x98),
+        // F1–F12: 0xF704–0xF70F → 0x80–0x8B
+        c if (c as u32) >= 0xF704 && (c as u32) <= 0xF70F =>
+            Some(0x80 + (c as u32 - 0xF704) as u8),
+        _ => None,
+    }
+}
+
+// ── UI launch ─────────────────────────────────────────────────────────
 
 pub fn launch(vm: VirtualMachine) {
     let vm = Rc::new(RefCell::new(vm));
@@ -69,7 +120,54 @@ pub fn launch(vm: VirtualMachine) {
         });
     }
 
-    // Timer: runs ~10 000 steps per 16 ms tick (~60 Hz) while is_running.
+    // ── Keyboard: key-down ───────────────────────────────────────────
+    {
+        let vm_rc = vm.clone();
+        let app_weak = app.as_weak();
+        app.on_key_down(move |text, shift, ctrl, alt| {
+            let c = match text.chars().next() { Some(c) => c, None => return };
+
+            // Handle Caps Lock toggle
+            if c == KEY_CAPS_LOCK {
+                let mut state = vm_rc.borrow_mut();
+                state.keyboard.caps_lock = !state.keyboard.caps_lock;
+                drop(state);
+                if let Some(app) = app_weak.upgrade() {
+                    sync_state(&app, &vm_rc.borrow());
+                }
+                return;
+            }
+
+            // Skip bare modifier key presses
+            if is_modifier_key(c) { return; }
+
+            if let Some(keycode) = slint_key_to_keycode(&text) {
+                let mut state = vm_rc.borrow_mut();
+                let caps = state.keyboard.caps_lock;
+                let mods: u8 = (shift as u8)
+                    | ((ctrl as u8) << 1)
+                    | ((alt  as u8) << 2)
+                    | ((caps as u8) << 3);
+                state.key_down(keycode, mods);
+                drop(state);
+                if let Some(app) = app_weak.upgrade() {
+                    sync_state(&app, &vm_rc.borrow());
+                }
+            }
+        });
+    }
+
+    // ── Keyboard: key-up ─────────────────────────────────────────────
+    {
+        let vm_rc = vm.clone();
+        app.on_key_up(move |text| {
+            if let Some(keycode) = slint_key_to_keycode(&text) {
+                vm_rc.borrow_mut().key_up(keycode);
+            }
+        });
+    }
+
+    // ── Run timer: ~10 000 steps per 16 ms tick ───────────────────────
     let run_timer = Timer::default();
     {
         let vm_rc = vm.clone();
@@ -87,9 +185,7 @@ pub fn launch(vm: VirtualMachine) {
                 hit_halt
             };
 
-            if halted {
-                app.set_is_running(false);
-            }
+            if halted { app.set_is_running(false); }
             sync_state(&app, &vm_rc.borrow());
         });
     }
@@ -97,7 +193,7 @@ pub fn launch(vm: VirtualMachine) {
     app.run().expect("Event loop error");
 }
 
-// ── helpers ──────────────────────────────────────────────────────────
+// ── State sync ────────────────────────────────────────────────────────
 
 fn sync_state(app: &AppWindow, vm: &VirtualMachine) {
     app.set_pc_text(fmt_hex(vm.cpu.pc).into());
@@ -116,7 +212,20 @@ fn sync_state(app: &AppWindow, vm: &VirtualMachine) {
 
     app.set_registers(build_register_model(vm));
     app.set_display_image(build_display_image(&vm.ram));
+
+    // Keyboard status
+    let m = vm.keyboard.modifiers;
+    app.set_kb_queue(vm.keyboard.queue.len() as i32);
+    app.set_kb_shift(m & 0x01 != 0);
+    app.set_kb_ctrl(m & 0x02 != 0);
+    app.set_kb_alt(m & 0x04 != 0);
+    app.set_kb_caps(vm.keyboard.caps_lock);
+    app.set_kb_last_key(format!("0x{:02X}", vm.keyboard.last_keycode).into());
+
+    app.set_hex_rows(build_hex_model(vm));
 }
+
+// ── Helpers ───────────────────────────────────────────────────────────
 
 fn fmt_hex(v: u16) -> String {
     format!("0x{:04X}", v)
@@ -140,15 +249,22 @@ fn format_current_instruction(vm: &VirtualMachine) -> (String, String) {
     (hex, crate::decode_instruction(vm.cpu.pc, &vm.ram))
 }
 
-fn build_register_model(vm: &VirtualMachine) -> ModelRc<RegEntry> {
-    let mut v: Vec<RegEntry> = (0..16_usize)
-        .map(|i| RegEntry {
-            name:  format!("R{:<2}", i).into(),
-            value: fmt_hex(vm.cpu.registers[i]).into(),
+fn build_register_model(vm: &VirtualMachine) -> ModelRc<RegPair> {
+    // 8 rows R0/R8 … R7/R15, then SP/PC
+    let mut v: Vec<RegPair> = (0..8_usize)
+        .map(|i| RegPair {
+            left_name:   format!("R{}", i).into(),
+            left_value:  fmt_hex(vm.cpu.registers[i]).into(),
+            right_name:  format!("R{}", i + 8).into(),
+            right_value: fmt_hex(vm.cpu.registers[i + 8]).into(),
         })
         .collect();
-    v.push(RegEntry { name: "SP".into(), value: fmt_hex(vm.cpu.sp).into() });
-    v.push(RegEntry { name: "PC".into(), value: fmt_hex(vm.cpu.pc).into() });
+    v.push(RegPair {
+        left_name:   "SP".into(),
+        left_value:  fmt_hex(vm.cpu.sp).into(),
+        right_name:  "PC".into(),
+        right_value: fmt_hex(vm.cpu.pc).into(),
+    });
     ModelRc::new(VecModel::from(v))
 }
 
@@ -174,4 +290,63 @@ fn build_display_image(ram: &[u8]) -> Image {
     }
 
     Image::from_rgba8(buf)
+}
+
+fn build_hex_model(vm: &VirtualMachine) -> ModelRc<HexRow> {
+    let (instr_start, instr_end) = vm.instruction_byte_range();
+    let pc_row = (vm.cpu.pc / 16) as i32;
+    let start_row = (pc_row - 8).max(0) as u16;
+    let total_rows: u16 = 32;
+
+    let rows: Vec<HexRow> = (0..total_rows).map(|i| {
+        let row_addr = (start_row + i) * 16;
+        let row_end  = row_addr + 15;
+
+        // Determine which byte offsets within this row are highlighted
+        let hi_start = if instr_start >= row_addr && instr_start <= row_end {
+            Some((instr_start - row_addr) as usize)
+        } else if instr_start < row_addr && instr_end >= row_addr {
+            Some(0)
+        } else {
+            None
+        };
+        let hi_end = hi_start.map(|_| {
+            let end = instr_end.min(row_end);
+            (end - row_addr) as usize
+        });
+        let has_highlight = hi_start.is_some();
+
+        // Build hex segments and ascii
+        let mut pre_hex  = String::new();
+        let mut hi_hex   = String::new();
+        let mut post_hex = String::new();
+        let mut ascii    = String::new();
+
+        for j in 0..16usize {
+            let addr = row_addr as usize + j;
+            let byte = vm.ram[addr];
+            let sep = if j == 8 { "  " } else { "" };
+
+            let hex_part = format!("{}{:02X} ", sep, byte);
+
+            match (hi_start, hi_end) {
+                (Some(hs), Some(he)) if j >= hs && j <= he => hi_hex.push_str(&hex_part),
+                (Some(hs), _)        if j < hs             => pre_hex.push_str(&hex_part),
+                _                                           => post_hex.push_str(&hex_part),
+            }
+
+            ascii.push(if byte >= 0x20 && byte < 0x7F { byte as char } else { '.' });
+        }
+
+        HexRow {
+            addr:          format!("0x{:04X}  ", row_addr).into(),
+            pre_hex:       SharedString::from(pre_hex.trim_end()),
+            hi_hex:        SharedString::from(hi_hex.trim_end()),
+            post_hex:      SharedString::from(post_hex.trim_end()),
+            ascii:         ascii.into(),
+            has_highlight: has_highlight,
+        }
+    }).collect();
+
+    ModelRc::new(VecModel::from(rows))
 }
